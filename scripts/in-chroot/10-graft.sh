@@ -980,4 +980,624 @@ systemctl enable sheng-expand-home.service 2>/dev/null \
   && log "已启用 sheng-expand-home（有 home 分区就自动格式化 + 扩容）" \
   || warn "启用 sheng-expand-home 失败"
 
+# 12) Steam / 会话集成（继续移植同一份 Frame 底包的修复）
+#     这一批都是「底包是给 Frame 头显写的，平板/掌机上跑不起来」的直接后果。
+
+# 12.1 权限修复：pkexec / sudo / dbus-daemon-launch-helper 的 setuid 位
+#   原话：Extracting packages as a normal user (or copying the SD) drops those bits.
+#   我们是 rsync 铺底包 + pacman 装包，setuid 位有可能被抹掉 —— 而这一条正好能解释
+#   我们之前遇到的 "Could not contact hostnamed, got: Launch helper exited with unknown
+#   return code 1"：dbus-daemon-launch-helper 少了 setuid root 就没法替别人起服务。
+cat > /usr/lib/steamos/sheng-restore-privs <<'EOF'
+#!/bin/bash
+# 恢复必须 setuid root 的程序的权限位（镜像拷贝/解包很容易丢这些位）
+set -uo pipefail
+log() { printf 'sheng-restore-privs: %s\n' "$*"; }
+fix_suid() {
+  local path="$1" mode="${2:-4755}" owner="${3:-root:root}"
+  [[ -e "$path" ]] || return 0
+  chown "$owner" "$path" 2>/dev/null || return 0
+  chmod "$mode" "$path" 2>/dev/null || return 0
+  log "fixed $path ($mode $owner)"
+}
+# PolicyKit / sudo：pkexec 必须 setuid root，否则桌面提权直接失败
+fix_suid /usr/bin/pkexec 4755 root:root
+fix_suid /usr/bin/sudo 4755 root:root
+fix_suid /usr/lib/polkit-1/polkit-agent-helper-1 4755 root:root
+# shadow / util-linux
+fix_suid /usr/bin/su 4755 root:root
+fix_suid /usr/bin/passwd 4755 root:root
+fix_suid /usr/bin/newgrp 4755 root:root
+fix_suid /usr/bin/chsh 4755 root:root
+fix_suid /usr/bin/chfn 4755 root:root
+fix_suid /usr/bin/gpasswd 4755 root:root
+fix_suid /usr/bin/unix_chkpwd 4755 root:root
+fix_suid /usr/bin/mount 4755 root:root
+fix_suid /usr/bin/umount 4755 root:root
+# D-Bus 系统总线辅助程序：有 dbus 组就 root:dbus，没有就 root:root
+if getent group dbus >/dev/null 2>&1; then
+  fix_suid /usr/lib/dbus-1.0/dbus-daemon-launch-helper 4750 root:dbus
+else
+  fix_suid /usr/lib/dbus-1.0/dbus-daemon-launch-helper 4750 root:root
+fi
+exit 0
+EOF
+chmod 0755 /usr/lib/steamos/sheng-restore-privs
+cat > /usr/lib/systemd/system/sheng-restore-privs.service <<'EOF'
+[Unit]
+Description=sheng: 恢复 pkexec/sudo 等程序的 setuid 位
+DefaultDependencies=no
+After=local-fs.target
+Before=display-manager.service polkit.service sudo.service multi-user.target
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/steamos/sheng-restore-privs
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+# 构建期就先跑一次（chroot 里跑，权限位直接落进镜像里，不必等首启）
+bash /usr/lib/steamos/sheng-restore-privs 2>&1 | sed 's/^/    /' || true
+systemctl enable sheng-restore-privs.service 2>/dev/null \
+  && log "已启用 sheng-restore-privs（并已在构建期执行过一次）" || warn "启用 sheng-restore-privs 失败"
+
+# 12.2 steamvr 桩：RUNSTEAM / steam-health-check 会调用 `steamvr`，SM8550 上不该真去连 OpenVR
+install -d /usr/lib/steamos/sheng-bin
+cat > /usr/lib/steamos/sheng-bin/steamvr <<'EOF'
+#!/bin/bash
+# Frame 的 steam-health-check 和 RUNSTEAM 会调用 `steamvr`；这台设备没有 VR，直接成功退出。
+exit 0
+EOF
+chmod 0755 /usr/lib/steamos/sheng-bin/steamvr
+
+# 12.3 steamui 补丁
+#   原话：Frame / steamdeck_stable ARM Gamepad UI hangs the library spinner until
+#   AppStore sees update_complete(). This client only sends partial overviews so that
+#   flag never arrives. 压缩后的变量名会随版本变，所以**按正则打补丁**而不是固定字符串。
+cat > /usr/lib/steamos/sheng-patch-steamui <<'EOF'
+#!/bin/bash
+# 修 Steam 库一直转圈：AppStore 等 update_complete() 永远等不到。
+# 正则匹配（压缩后的名字每版都变），打不上就原样退出，不会破坏客户端。
+set +e
+root="${1:-/home/steamos/.local/share/Steam/steamui}"
+python3 - "$root" <<'PY'
+import re, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+if not root.is_dir():
+    sys.exit(0)
+_END = r"\)" r"\}" r"\)" r"\}" r"\)"
+APP_WAIT = re.compile(
+    r"await new Promise\(\((\w+),(\w+)\)=>\{let (\w+)=\1;"
+    r"SteamClient\.Apps\.RegisterForAppOverviewChanges\((\w+)=>\{"
+    r"this\.UpdateAppOverview\(\4\)&&\(this\.m_bIsInitialized=!0,"
+    r"\3&&\3\(\),\3=null" + _END
+)
+APP_WAIT_NEW = (
+    r"await new Promise((\1,\2)=>{let \3=\1;"
+    r"const done=()=>{this.m_bIsInitialized=!0;\3&&\3();\3=null};"
+    r"setTimeout(done,1500);"
+    r"SteamClient.Apps.RegisterForAppOverviewChanges(\4=>{"
+    r"this.UpdateAppOverview(\4);done()})})"
+)
+OLD_CHECK = (
+    "GetMostSpecificCheckResult(){const e=this.m_updateState.update_check_results??"
+    "[{eresult:s.R}];let t=!1;for(const r of e)if(r.eresult!=s.R){if(r.eresult!=s.zi)"
+    "return r.eresult;t=!0}return t?s.zi:s.R}"
+)
+NEW_CHECK = (
+    "GetMostSpecificCheckResult(){const e=this.m_updateState.update_check_results??"
+    "[{eresult:s.R}];let t=!1;for(const r of e){if(40===r.eresult&&!r.available)continue;"
+    "if(r.eresult!=s.R){if(r.eresult!=s.zi)return r.eresult;t=!0}}return t?s.zi:s.R}"
+)
+changed = 0
+for p in list(root.glob("chunk*.js")) + list(root.glob("library.js")):
+    txt = p.read_text(errors="replace")
+    orig = txt
+    if "setTimeout(done,1500)" not in txt and "RegisterForAppOverviewChanges" in txt:
+        txt, n = APP_WAIT.subn(APP_WAIT_NEW, txt, count=1)
+    if "40===r.eresult&&!r.available" not in txt and OLD_CHECK in txt:
+        txt = txt.replace(OLD_CHECK, NEW_CHECK, 1)
+    complete = "return l&&s.oy.ScopeRunningApps(),w.md.OnAppOverviewChange(a,n),t.update_complete()}"
+    complete_new = "return l&&s.oy.ScopeRunningApps(),w.md.OnAppOverviewChange(a,n),(this.m_bIsInitialized=!0,!0)}"
+    if complete in txt:
+        txt = txt.replace(complete, complete_new)
+    if txt != orig:
+        p.write_text(txt); changed += 1
+print(f"steamui files patched: {changed}", file=sys.stderr)
+PY
+exit 0
+EOF
+chmod 0755 /usr/lib/steamos/sheng-patch-steamui
+
+# 12.4 steam-health-check 替换
+#   原话：Official Frame health-check re-extracts steam.tar.zst after a few short sessions.
+#   Force-off while the wheel is up counts as failure and wipes the handheld ARM client.
+#   也就是「开机几次后被官方健康检查删掉 Steam 客户端」——必须换掉。
+if [[ -e /usr/share/deckard/steam-health-check ]]; then
+  cp -f /usr/share/deckard/steam-health-check /usr/share/deckard/steam-health-check.stock 2>/dev/null || true
+  cat > /usr/share/deckard/steam-health-check <<'EOF'
+#!/bin/bash
+# 官方 Frame 的健康检查会在几次短会话后重新解 steam.tar.zst，
+# 而这个动作在「转圈时强制关机」被算作失败，会把 ARM 客户端整个抹掉。这里一律不改动。
+set +e
+TRIPLEFROG_FILE="${XDG_RUNTIME_DIR:-/tmp}/steam-short-session-tracker"
+STEAMROOT="${HOME}/.local/share/Steam"
+mkdir -p "${STEAMROOT}" 2>/dev/null || true
+case "${1:-}" in
+  --track-started)
+    touch "${TRIPLEFROG_FILE}"; touch "${STEAMROOT}/.install-complete"; rm -f "${STEAMROOT}/.crash" ;;
+  --track-stopped|--repair-now)
+    : >"${TRIPLEFROG_FILE}" 2>/dev/null || true
+    touch "${STEAMROOT}/.install-complete"; rm -f "${STEAMROOT}/.crash" ;;
+  *) echo "Usage: $0 --track-started | --track-stopped | --repair-now" >&2; exit 1 ;;
+esac
+exit 0
+EOF
+  chmod 0755 /usr/share/deckard/steam-health-check
+  log "已替换 steam-health-check（官方那个会抹掉 Steam 客户端）"
+fi
+
+# 12.5 RUNSTEAM.sh 替换
+#   原话：Do not pass -deckard / -vrgamepadui: those switch the client beta to the
+#   internal Steam Frame build and wait on SteamVR. 另外它还处理：强制关机留下的 .crash /
+#   Chrome 单例锁、linuxarm64 里 0 字节的 steamclient.so、steamui 资源缺失、steam.cfg
+#   的 bootstrapper 抑制。
+if [[ -e /usr/share/deckard/RUNSTEAM.sh ]]; then
+  cp -f /usr/share/deckard/RUNSTEAM.sh /usr/share/deckard/RUNSTEAM.sh.stock 2>/dev/null || true
+  cat > /usr/share/deckard/RUNSTEAM.sh <<'EOF'
+#!/bin/bash
+# sheng 的 Steam 启动器。不要传 -deckard / -vrgamepadui —— 那两个会把客户端切到
+# Frame 内部构建并去等 SteamVR（这台设备没有 VR）。
+set -euo pipefail
+STEAMROOT="$( cd -- "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+
+STEAM_RT_ARM64=steamrtarm64
+STEAM_SDK_ARM64=linuxarm64
+[[ -d "${STEAMROOT}/${STEAM_RT_ARM64}" ]] || { [[ -d "${STEAMROOT}/linuxarm64" ]] && STEAM_RT_ARM64="linuxarm64"; }
+[[ -d "${STEAMROOT}/${STEAM_SDK_ARM64}" ]] || { [[ -d "${STEAMROOT}/steamrtarm64" ]] && STEAM_SDK_ARM64="steamrtarm64"; }
+
+export LD_LIBRARY_PATH="${STEAMROOT}/${STEAM_RT_ARM64}"
+export SteamDeck="${SteamDeck:-1}"
+export QT_QPA_PLATFORM=xcb
+export _STEAM_SETENV_MANAGER=1
+export DISPLAY="${DISPLAY:-:0}"
+if [[ -z "${GAMESCOPE_WAYLAND_DISPLAY:-}" ]]; then
+  [[ -S "${XDG_RUNTIME_DIR:-/run/user/1000}/gamescope-0" ]] && export GAMESCOPE_WAYLAND_DISPLAY=gamescope-0
+fi
+export GAMESCOPE_WAYLAND_DISPLAY="${GAMESCOPE_WAYLAND_DISPLAY:-gamescope-0}"
+unset WAYLAND_DISPLAY XDG_SESSION_TYPE || true
+for _i in $(seq 1 50); do [[ -S /tmp/.X11-unix/X0 ]] && break; sleep 0.1; done
+
+# 强制关机留下的 .crash 会让 Steam 打开「更新界面」并报 "steam didn't shutdown cleanly"
+rm -f "${STEAMROOT}/.crash" "${STEAMROOT}/steam.pid" 2>/dev/null || true
+
+# 抑制 bootstrapper：ARM 客户端重新自更新会把 Gamepad UI 卡在转圈上
+printf '%s\n' \
+  'BootStrapperInhibitAll=enable' \
+  'BootStrapperForceSelfUpdate=disable' \
+  'BootStrapperInhibitClientChecksum=enable' \
+  'BootStrapperInhibitBootstrapperChecksum=enable' \
+  'BootStrapperInhibitUpdateOnLaunch=enable' \
+  >"${STEAMROOT}/steam.cfg" 2>/dev/null || true
+if [[ ! -s "${STEAMROOT}/steam.inf" ]]; then
+  printf 'ClientVersion=%s\n' "1788652215" >"${STEAMROOT}/steam.inf"
+  cp -f "${STEAMROOT}/steam.inf" "${STEAMROOT}/${STEAM_RT_ARM64}/steam.inf" 2>/dev/null || true
+fi
+
+# Chrome 单例锁 + 半写的 htmlcache 会让 index.html 画出来但永远不加载 libraries.js
+htmlcache="${STEAMROOT}/config/htmlcache"
+if [[ -L "${htmlcache}/SingletonLock" || -e "${htmlcache}/SingletonLock" ]]; then
+  rm -f "${htmlcache}/SingletonLock" "${htmlcache}/SingletonCookie" "${htmlcache}/SingletonSocket" 2>/dev/null || true
+fi
+
+# Frame 自带的 steamui 资源不完整（缺 libraries~*），从 steam.tar.zst 里补
+steam_tar=/usr/lib/steam/steam.tar.zst
+if [[ -f "$steam_tar" && ! -s "${STEAMROOT}/steamui/index.html" ]]; then
+  rm -rf "${STEAMROOT}/steamui"
+  tar --zstd -xf "$steam_tar" -C "${STEAMROOT}" ./steamui 2>/dev/null || true
+fi
+[[ -x /usr/lib/steamos/sheng-patch-steamui ]] && \
+  /usr/lib/steamos/sheng-patch-steamui "${STEAMROOT}/steamui" >/dev/null 2>&1 || true
+
+# Frame 的 tar 会把 linuxarm64/steamclient.so 留成 0 字节，webhelper dlopen 它就出不了 BPM 窗口
+if [[ -d "${STEAMROOT}/linuxarm64" && -d "${STEAMROOT}/steamrtarm64" ]]; then
+  for _lib in steamclient.so crashhandler.so steam-launch-wrapper; do
+    _src="${STEAMROOT}/steamrtarm64/${_lib}"; _dst="${STEAMROOT}/linuxarm64/${_lib}"
+    [[ -s "$_src" && ! -s "$_dst" ]] && cp -f "$_src" "$_dst" 2>/dev/null || true
+  done
+fi
+
+ln_for_real() { [[ -d "${2}" ]] && rm -rf "${2}"; ln -sTfn "${1}" "${2}"; }
+mkdir -p ~/.steam
+ln_for_real "${STEAMROOT}" ~/.steam/steam
+ln_for_real "${STEAMROOT}" ~/.steam/root
+ln_for_real "${STEAMROOT}/linux32" ~/.steam/sdk32
+ln_for_real "${STEAMROOT}/linux64" ~/.steam/sdk64
+ln_for_real "${STEAMROOT}/${STEAM_SDK_ARM64}" ~/.steam/sdkarm64
+ln_for_real "${STEAMROOT}/${STEAM_RT_ARM64}" ~/.steam/binarm64
+ln_for_real "${STEAMROOT}/ubuntu12_32" ~/.steam/bin32
+ln_for_real "${STEAMROOT}/ubuntu12_64" ~/.steam/bin64
+
+export STEAM_RUNTIME="$STEAMROOT/ubuntu12_32/steam-runtime"
+export STEAM_RUNTIME_LIBRARY_PATH="$STEAM_RUNTIME/pinned_libs_32:$STEAM_RUNTIME/pinned_libs_64:/usr/local/lib/i386-linux-gnu:/lib/i386-linux-gnu:/usr/local/lib:/usr/local/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:/lib:$STEAM_RUNTIME/lib/i386-linux-gnu:$STEAM_RUNTIME/usr/lib/i386-linux-gnu:$STEAM_RUNTIME/lib/x86_64-linux-gnu:$STEAM_RUNTIME/usr/lib/x86_64-linux-gnu:$STEAM_RUNTIME/lib:$STEAM_RUNTIME/usr/lib"
+
+STEAM_ARGS=(
+  -cef-enable-debugging
+  -gamepadui
+  -steamos3
+  -steampal
+  -steamdeck
+  -noverifyfiles
+  -noshaders
+  -inhibitbootstrap
+  -nobootstrapperupdate
+  ${STEAM_EXTRA_ARGS:-}
+)
+
+cd "${STEAMROOT}"
+mkdir -p "${HOME}/.local/share/Steam/logs"
+# Steam 拒绝 LD_PRELOAD（unsafe unsetenv），会直接中止自己的启动界面
+unset LD_PRELOAD || true
+exec "${STEAMROOT}/${STEAM_RT_ARM64}/steam" "${STEAM_ARGS[@]}" \
+  >"${HOME}/.local/share/Steam/logs/steam_output.log" 2>&1
+EOF
+  chmod 0755 /usr/share/deckard/RUNSTEAM.sh
+  # steam.service 每次启动都会把它拷进用户目录
+  if [[ -d /home/steamos/.local/share/Steam ]]; then
+    cp -f /usr/share/deckard/RUNSTEAM.sh /home/steamos/.local/share/Steam/RUNSTEAM.sh 2>/dev/null || true
+    chmod 0755 /home/steamos/.local/share/Steam/RUNSTEAM.sh 2>/dev/null || true
+  fi
+  log "已替换 RUNSTEAM.sh（不再走 Frame 的 -deckard/-vrgamepadui 路径）"
+fi
+
+# 12.6 steamos-update / jupiter-dock 桩
+#   原话：Steam Software Updates toast: official steamos-update → pkexec/atomupd → 127。
+#   我们这套镜像没有 RAUC/atomupd 升级载荷，直接给出「已是最新」的语义。
+if [[ -e /usr/bin/steamos-update ]]; then
+  cp -f /usr/bin/steamos-update /usr/bin/steamos-update.stock 2>/dev/null || true
+  cat > /usr/bin/steamos-update <<'EOF'
+#!/usr/bin/env bash
+# Steam Gamepad UI 的「系统更新」钩子。本镜像没有 RAUC/atomupd 载荷。
+#   --supports-duplicate-detection → 0
+#   --mark-oobe-only               → 标记 OOBE 完成，退出 0
+#   check                          → 7（已是最新）
+#   apply（首次 OOBE）             → 0 + 标记 + 重启 steam.service
+#   apply（之后）                  → 7
+set -uo pipefail
+STEAM_HOME="${STEAM_HOME:-/home/steamos}"
+LOGINUSERS="${STEAM_HOME}/.local/share/Steam/config/loginusers.vdf"
+MARKER=/var/lib/sheng/oobe-os-update-acked
+USER_MARKER="${STEAM_HOME}/.local/share/Steam/.oobe-os-update-acked"
+REG_STEAM="${STEAM_HOME}/.steam/registry.vdf"
+REG_LOCAL="${STEAM_HOME}/.local/share/Steam/registry.vdf"
+
+mark_oobe_complete() {
+  python3 - "$@" <<'PY' 2>/dev/null || true
+import pathlib, re, sys
+WANT = (("CompletedOOBE", "1"), ("CompletedOOBEStage1", "1"))
+DROP = ("ForceOOBE", "ForceOOBEStage2")
+def upsert(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+    if '"Steam"' not in text:
+        lines = "\n".join(f'\t\t\t\t\t"{k}"\t\t"{v}"' for k, v in WANT)
+        text = ('"Registry"\n{\n\t"HKCU"\n\t{\n\t\t"Software"\n\t\t{\n'
+                '\t\t\t"Valve"\n\t\t\t{\n\t\t\t\t"Steam"\n\t\t\t\t{\n'
+                f"{lines}\n\t\t\t\t}}\n\t\t\t}}\n\t\t}}\n\t}}\n}}\n")
+        path.write_text(text, encoding="utf-8"); return
+    for k in DROP:
+        text = re.sub(r'^[ \t]*"' + re.escape(k) + r'"[ \t]*"[^"]*"[ \t]*\n', "", text, flags=re.M)
+    m = re.search(r'("HKCU"\s*\{.*?^[ \t]*"Steam"\s*\n[ \t]*\{)', text, flags=re.M | re.S)
+    if not m:
+        m = re.search(r'(^[ \t]*"Steam"\s*\n[ \t]*\{)', text, flags=re.M)
+    if not m:
+        path.write_text(text, encoding="utf-8"); return
+    head_end = m.end(); i = head_end; depth = 1
+    while i < len(text) and depth:
+        if text[i] == "{": depth += 1
+        elif text[i] == "}": depth -= 1
+        i += 1
+    block = text[head_end:i - 1]
+    indent = "\t\t\t\t\t"
+    child = re.search(r'\n([ \t]+)"', "\n" + block)
+    if child: indent = child.group(1)
+    for k, v in WANT:
+        pat = r'^[ \t]*"' + re.escape(k) + r'"[ \t]*"[^"]*"'
+        if re.search(pat, block, flags=re.M):
+            block = re.sub(pat, f'"{k}"\t\t"{v}"', block, count=1, flags=re.M)
+        else:
+            block = f'\n{indent}"{k}"\t\t"{v}"' + (block if block.startswith("\n") else "\n" + block)
+    path.write_text(text[:head_end] + block + text[i - 1:], encoding="utf-8")
+for p in sys.argv[1:]:
+    upsert(pathlib.Path(p))
+PY
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --supports-duplicate-detection) exit 0 ;;
+    --mark-oobe-only) mark_oobe_complete "$REG_STEAM" "$REG_LOCAL"; exit 0 ;;
+  esac
+done
+check=0
+for arg in "$@"; do [[ "$arg" == "check" ]] && check=1; done
+[[ "$check" -eq 1 ]] && exit 7
+
+oobe=0
+if [[ ! -f "$LOGINUSERS" ]] || ! grep -qs '"AccountName"' "$LOGINUSERS"; then oobe=1; fi
+[[ "$oobe" -eq 0 ]] && exit 7
+
+mkdir -p /var/lib/sheng "${STEAM_HOME}/.local/share/Steam" 2>/dev/null || true
+mark_oobe_complete "$REG_STEAM" "$REG_LOCAL"
+# 已经告诉过 Steam 一次 apply 成功；再回 0 会让「正在计算剩余时间」一直挂着
+[[ -f "$MARKER" || -f "$USER_MARKER" ]] && exit 7
+touch "$MARKER" "$USER_MARKER" 2>/dev/null || true
+
+# Steam 以 steamos 用户调用这里（没有 pkexec）。延迟 2 秒让 APPLY 0 先被看到，再重启 steam.service
+if [[ -x /usr/lib/steamos/sheng-oobe-restart-steam ]]; then
+  if [[ "$(id -u)" -eq 0 ]]; then
+    systemctl start --no-block sheng-oobe-restart-steam.service 2>/dev/null || true
+  else
+    systemd-run --user --collect --on-active=2s --unit=sheng-oobe-restart-steam-run \
+      /usr/lib/steamos/sheng-oobe-restart-steam >/dev/null 2>&1 \
+      || nohup bash -c "sleep 2; exec /usr/lib/steamos/sheng-oobe-restart-steam" >/dev/null 2>&1 &
+  fi
+fi
+exit 0
+EOF
+  chmod 0755 /usr/bin/steamos-update
+  install -d /usr/bin/steamos-polkit-helpers
+  cat > /usr/bin/steamos-polkit-helpers/steamos-update <<'EOF'
+#!/usr/bin/env bash
+# 不要 pkexec：Game Mode 里没有 polkit agent，pkexec/atomupd 会以 127 失败
+set -uo pipefail
+exec /usr/bin/steamos-update "$@"
+EOF
+  chmod 0755 /usr/bin/steamos-polkit-helpers/steamos-update
+  log "已替换 steamos-update（Game Mode 的「系统更新」不再报错）"
+fi
+
+# 12.7 OOBE 之后重启 Steam
+cat > /usr/lib/steamos/sheng-oobe-restart-steam <<'EOF'
+#!/bin/bash
+# OOBE 连完 WiFi 后 Steam 会停在「正在更新：计算剩余时间」。这里重启用户态 steam.service
+# 让 Game Mode 回到登录界面。注意 pkill 不够：steam.service 是 Restart=on-failure，
+# SIGTERM 会被当成正常退出，Steam 就一直躺着了。
+set -u
+sleep 2
+if [[ -x /usr/bin/steamos-update ]]; then
+  STEAM_HOME="${STEAM_HOME:-/home/steamos}" /usr/bin/steamos-update --mark-oobe-only >/dev/null 2>&1 || true
+fi
+if [[ "$(id -u)" -eq 0 ]]; then
+  systemctl --user -M steamos@ restart steam.service 2>/dev/null && exit 0
+  if [[ -d /run/user/1000 ]]; then
+    XDG_RUNTIME_DIR=/run/user/1000 systemctl --user restart steam.service 2>/dev/null && exit 0
+  fi
+else
+  systemctl --user restart steam.service 2>/dev/null && exit 0
+fi
+# 最后手段：SIGKILL 是异常退出，Restart=on-failure 会把它拉回来
+pkill -KILL -u steamos -f 'steamrtarm64/steam' 2>/dev/null || true
+pkill -KILL -u steamos -f 'linuxarm64/steam' 2>/dev/null || true
+exit 0
+EOF
+chmod 0755 /usr/lib/steamos/sheng-oobe-restart-steam
+cat > /usr/lib/systemd/system/sheng-oobe-restart-steam.service <<'EOF'
+[Unit]
+Description=OOBE 更新步骤之后重启 Steam
+After=local-fs.target
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/steamos/sheng-oobe-restart-steam
+Nice=0
+EOF
+
+# 12.8 start-gamescope-session 替换
+#   原话：Session type stays unset so Steam DisplayManager uses GAMESCOPE_WAYLAND_DISPLAY；
+#   QT_QPA_PLATFORM=xcb 只能留在本进程和 steam.service 里 —— 一旦 import 进 user manager，
+#   「切换到桌面」就会用 xcb 去起 Plasma（没有 X 服务器）→ 黑屏。
+if [[ -e /usr/bin/start-gamescope-session ]]; then
+  cp -f /usr/bin/start-gamescope-session /usr/bin/start-gamescope-session.stock 2>/dev/null || true
+  cat > /usr/bin/start-gamescope-session <<'EOF'
+#!/bin/sh
+# 启动用户态 gamescope-session.target。会话类型保持不设置，
+# 好让 Steam 的 DisplayManager 走 GAMESCOPE_WAYLAND_DISPLAY（wayland: modeset）。
+TARGET="${1:-gamescope-session.target}"
+
+systemctl --user stop graphical-session.target
+systemctl --user reset-failed
+
+unset XDG_SESSION_TYPE
+export XDG_CURRENT_DESKTOP=gamescope
+export XDG_SESSION_DESKTOP=gamescope
+export DESKTOP_SESSION=gamescope
+export QT_QPA_PLATFORM=xcb
+
+# QT_QPA_PLATFORM=xcb 只留在本进程与 steam.service：
+# 导入 user manager 会让「切换到桌面」以 xcb 起 Plasma（没有 X）→ 黑屏
+systemctl --user unset-environment XDG_SESSION_TYPE WAYLAND_DISPLAY QT_QPA_PLATFORM || true
+systemctl --user set-environment XDG_CURRENT_DESKTOP=gamescope || true
+systemctl --user set-environment XDG_SESSION_DESKTOP=gamescope || true
+systemctl --user set-environment DESKTOP_SESSION=gamescope || true
+
+dbus-update-activation-environment --systemd DESKTOP_SESSION XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP >/dev/null 2>&1 || true
+
+systemctl --user set-environment XDG_DESKTOP_PORTAL_DIR="/usr/share/xdg-desktop-portal/gamescope-portals"
+systemctl --user set-environment "GAMESCOPE_SESSION_TARGET=${TARGET}"
+systemctl --user unset-environment DISPLAY XAUTHORITY WAYLAND_DISPLAY || true
+
+trap "systemctl --user stop ${TARGET}" HUP INT TERM
+
+systemctl --user --wait start "${TARGET}" &
+wait
+logger Gamescope Session Ended - Performing Final Cleanup
+
+systemctl --user unset-environment QT_QPA_PLATFORM GAMESCOPE_WAYLAND_DISPLAY GAMESCOPE_SESSION_TARGET || true
+systemctl --user stop graphical-session-pre.target
+logger Gamescope Session Ended - Cleanup Complete
+EOF
+  chmod 0755 /usr/bin/start-gamescope-session
+  log "已替换 start-gamescope-session（xcb 不再泄漏进 user manager）"
+fi
+
+# 12.9 steam.service 的 drop-in：bootstrap 参数 + gamescope 绑定
+install -d /usr/lib/systemd/user/steam.service.d
+cat > /usr/lib/systemd/user/steam.service.d/99-sheng-bootstrap.conf <<'EOF'
+[Service]
+# 跳过 ARM CDN bootstrapper（就是那个「正在更新：计算剩余时间」）
+Environment=STEAM_EXTRA_ARGS=-inhibitbootstrap -nobootstrapperupdate -noverifyfiles
+EOF
+cat > /usr/lib/systemd/user/steam.service.d/99-sheng.conf <<'EOF'
+[Unit]
+Wants=
+After=
+After=gamescope-session.service
+# 「切换到桌面」会停掉 gamescope；Restart=always 会让 Steam 在没有 Xwayland 的情况下重生
+# → "Unable to open a connection to X"
+BindsTo=gamescope-session.service
+PartOf=gamescope-session.service
+[Service]
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=180
+Environment=PATH=/usr/lib/steamos/sheng-bin:/usr/bin:/bin
+# gamescope 上 Qt/CEF 走 Xwayland；DisplayManager 用 GAMESCOPE_WAYLAND_DISPLAY 走 Wayland
+Environment=QT_QPA_PLATFORM=xcb
+Environment=DISPLAY=:0
+Environment=GAMESCOPE_WAYLAND_DISPLAY=gamescope-0
+Environment=XDG_CURRENT_DESKTOP=gamescope
+Environment=XDG_SESSION_DESKTOP=gamescope
+Environment=_STEAM_SETENV_MANAGER=1
+Environment=SteamDeck=1
+UnsetEnvironment=WAYLAND_DISPLAY
+UnsetEnvironment=XDG_SESSION_TYPE
+# 别让 Frame 的健康检查在 2 秒内判定失败就把 ~/.local/share/Steam 抹掉
+ExecStopPost=
+EOF
+log "已写入 steam.service 的两个 drop-in（bootstrap + gamescope 绑定）"
+
+# 12.10 Steam 窗口焦点补丁
+#   原话：gamescope --steam only focuses windows tagged STEAM_GAME. If Steam never sets
+#   the atom, Gamepad UI stays unfocused (black nested surface) while the client is running.
+cat > /usr/lib/steamos/sheng-steam-focus <<'EOF'
+#!/bin/bash
+# 给 Steam 的窗口补上 STEAM_GAME atom，否则 gamescope 不给它焦点（嵌套面全黑）
+set +e
+export DISPLAY="${DISPLAY:-:0}"
+command -v xprop >/dev/null 2>&1 || exit 0
+command -v xwininfo >/dev/null 2>&1 || exit 0
+tag() {
+  local ids id
+  ids="$(xwininfo -root -tree 2>/dev/null | awk '/[Ss]team/{ if (match($0, /0x[0-9a-fA-F]+/)) print substr($0, RSTART, RLENGTH) }' | sort -u)"
+  for id in $ids; do
+    [[ -n "$id" ]] || continue
+    if ! xprop -id "$id" STEAM_GAME 2>/dev/null | grep -q 'STEAM_GAME(CARDINAL)'; then
+      xprop -id "$id" -f STEAM_GAME 32c -set STEAM_GAME 769 2>/dev/null || true
+      xprop -id "$id" -f STEAM_OVERLAY 32c -set STEAM_OVERLAY 0 2>/dev/null || true
+      xprop -id "$id" -f STEAM_BIGPICTURE 32c -set STEAM_BIGPICTURE 1 2>/dev/null || true
+    fi
+  done
+}
+for _i in 1 2 3 4 5 6 7 8 9 10 11 12; do sleep 2; tag; done
+exit 0
+EOF
+chmod 0755 /usr/lib/steamos/sheng-steam-focus
+cat > /usr/lib/systemd/user/sheng-steam-focus.service <<'EOF'
+[Unit]
+Description=sheng: 给 Steam 窗口补 STEAM_GAME atom（gamescope 只聚焦带这个 atom 的窗口）
+After=steam.service gamescope-session.service
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/steamos/sheng-steam-focus
+EOF
+log "已放入 sheng-steam-focus（+ 同名的 user 单元）"
+
+# 13) 在 Frame rootfs 内自编 KDE 组件：KF6 NetworkManagerQt + libksysguard + plasma-systemmonitor
+#   为什么必须"在镜像里"编（照抄 MaSieS4Fun/SteamOS-ARM-SM8550 的结论）：
+#     ① Frame 的 extra 是 6.0 快照，和底包自带的 Plasma/KF6 6.2.5 版本不匹配 ——
+#        实测装 extra 的 plasma-systemmonitor 6.0.4 直接加载失败：
+#        libPlasmaSystemMonitorPage.so: undefined symbol ...SensorFaceControllerC1...
+#     ② 在我们自己那条 ALARM 构建 chroot 里编也不行：那是 Qt 6.11 / glibc 2.43 的链，
+#        编出来的东西在 glibc 2.39 的底包上加载不了（他们 build-box64 就踩过这个）。
+#   所以：在这个（已经 chroot 进底包的）环境里装构建依赖 + 源码编译。
+#   全程失败只告警 —— 编不出来镜像照出，缺的只是系统监视器和网络统计。
+if [[ "${BUILD_KDE_MONITOR:-1}" == "1" ]]; then
+  (
+    set +e
+    log "13) 自编 KDE 组件（系统监视器 / KF6 NetworkManagerQt）"
+    export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+    KDE_DEPS="base-devel cmake ninja extra-cmake-modules pkgconf \
+              qt6-base qt6-declarative qt6-tools qt6-wayland \
+              kconfig kcoreaddons ki18n kio kitemodels kirigami kquickcharts kpackage kdeclarative \
+              networkmanager-qt modemmanager-qt polkit-qt6 libnl libpcap"
+    pacman -Sy --noconfirm >/dev/null 2>&1
+    pacman -Qq > /tmp/kde-before.txt 2>/dev/null
+    pacman -S --noconfirm --needed --color never $KDE_DEPS 2>&1 | tail -3 | sed 's/^/    /'
+    pacman -Qq > /tmp/kde-after.txt 2>/dev/null
+    comm -13 <(sort /tmp/kde-before.txt) <(sort /tmp/kde-after.txt) > /tmp/kde-added.txt 2>/dev/null
+    log "    构建依赖就绪（本次新装 $(wc -l < /tmp/kde-added.txt 2>/dev/null || echo 0) 个包）"
+
+    mkdir -p /tmp/kde-build && cd /tmp/kde-build || exit 0
+
+    kde_build() {   # $1=名字 $2=下载地址 $3=解压目录
+      local name="$1" url="$2" dir="$3"
+      log "    ├─ $name"
+      curl -fsSL --retry 2 --max-time 300 -o "$name.tar.xz" "$url" || { warn "    └─ 下载失败: $url"; return 1; }
+      tar -xf "$name.tar.xz" || { warn "    └─ 解压失败"; return 1; }
+      cmake -S "$dir" -B "$dir.build" -G Ninja \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING=OFF -DBUILD_QCH=OFF -DBUILD_EXAMPLES=OFF >/dev/null 2>&1 \
+        || { warn "    └─ cmake 配置失败（依赖缺？）"; return 1; }
+      cmake --build "$dir.build" -j"$(nproc)" >/dev/null 2>&1 \
+        || { warn "    └─ 编译失败"; return 1; }
+      cmake --install "$dir.build" >/dev/null 2>&1 \
+        || { warn "    └─ 安装失败"; return 1; }
+      log "    └─ 完成"
+      return 0
+    }
+
+    # ① KF6 NetworkManagerQt —— ksystemstats 的网络插件就是因为缺它才加载失败：
+    #    ksystemstats_plugin_network.so → libKF6NetworkManagerQt.so.6: 没有那个文件
+    if ls /usr/lib/libKF6NetworkManagerQt.so* >/dev/null 2>&1; then
+      log "    KF6 NetworkManagerQt 已存在，跳过"
+    else
+      kde_build networkmanager-qt \
+        "https://download.kde.org/stable/frameworks/6.14/networkmanager-qt-6.14.0.tar.xz" \
+        "networkmanager-qt-6.14.0"
+    fi
+
+    # ② libksysguard 6.2.5 —— 与底包同版本（ABI 一致，plasma-workspace 照旧能用），
+    #    同时提供 plasma-systemmonitor 编译所需的头文件（extra 里那份是 6.0 的，不能用）
+    kde_build libksysguard \
+      "https://download.kde.org/stable/plasma/6.2.5/libksysguard-6.2.5.tar.xz" \
+      "libksysguard-6.2.5"
+
+    # ③ plasma-systemmonitor 6.2.5 —— KDE 的系统监视器（任务管理器）
+    kde_build plasma-systemmonitor \
+      "https://download.kde.org/stable/plasma/6.2.5/plasma-systemmonitor-6.2.5.tar.xz" \
+      "plasma-systemmonitor-6.2.5"
+
+    ldconfig 2>/dev/null || true
+
+    # 收尾：把纯构建工具删掉（编译链不需要跟着镜像走；只删这三个最保险的）
+    pacman -Rdd --noconfirm --color never cmake ninja extra-cmake-modules >/dev/null 2>&1 || true
+    rm -rf /tmp/kde-build /tmp/kde-before.txt /tmp/kde-after.txt
+
+    # 自检
+    if [[ -x /usr/bin/plasma-systemmonitor ]]; then
+      log "    ✓ /usr/bin/plasma-systemmonitor 已就位（KDE 系统监视器）"
+    else
+      warn "    ✗ 没有 plasma-systemmonitor —— 系统监视器仍然缺失（其它功能不受影响）"
+    fi
+    if ls /usr/lib/libKF6NetworkManagerQt.so* >/dev/null 2>&1; then
+      log "    ✓ libKF6NetworkManagerQt 已就位（ksystemstats 的网络项）"
+    else
+      warn "    ✗ 缺 libKF6NetworkManagerQt（系统监视器里网络项无数据）"
+    fi
+    exit 0
+  ) 2>&1 | sed 's/^/[kde] /' || warn "自编 KDE 组件这一段失败（不影响出图）"
+fi
+
 log "sheng 设备层注入完成（内核 $KVER）"
