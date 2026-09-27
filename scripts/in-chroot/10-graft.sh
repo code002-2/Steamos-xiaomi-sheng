@@ -1543,36 +1543,55 @@ if [[ "${BUILD_KDE_MONITOR:-1}" == "1" ]]; then
               networkmanager-qt modemmanager-qt polkit-qt6 libnl libpcap"
     pacman -Sy --noconfirm >/dev/null 2>&1
     pacman -Qq > /tmp/kde-before.txt 2>/dev/null
-    pacman -S --noconfirm --needed --color never $KDE_DEPS 2>&1 | tail -3 | sed 's/^/    /'
+    KDE_PAC_OUT="$(pacman -S --noconfirm --needed --color never $KDE_DEPS 2>&1)"
+    printf '%s\n' "$KDE_PAC_OUT" | grep -E '^error|target not found|:: ' | head -20 | sed 's/^/    pacman: /' || true
     pacman -Qq > /tmp/kde-after.txt 2>/dev/null
     comm -13 <(sort /tmp/kde-before.txt) <(sort /tmp/kde-after.txt) > /tmp/kde-added.txt 2>/dev/null
-    log "    构建依赖就绪（本次新装 $(wc -l < /tmp/kde-added.txt 2>/dev/null || echo 0) 个包）"
+    KDE_ADDED="$(grep -c . /tmp/kde-added.txt 2>/dev/null || echo '?')"
+    log "    构建依赖就绪（新装 $KDE_ADDED 个包）"
+    printf '%s\n' "$KDE_PAC_OUT" | grep -c 'installing' | sed 's/^/    pacman 安装条目数: /' || true
 
     mkdir -p /tmp/kde-build && cd /tmp/kde-build || exit 0
 
     kde_build() {   # $1=名字 $2=下载地址 $3=解压目录
-      local name="$1" url="$2" dir="$3"
+      local name="$1" url="$2" dir="$3" logf="/tmp/kde-build/$name.log"
       log "    ├─ $name"
       curl -fsSL --retry 2 --max-time 300 -o "$name.tar.xz" "$url" || { warn "    └─ 下载失败: $url"; return 1; }
       tar -xf "$name.tar.xz" || { warn "    └─ 解压失败"; return 1; }
-      cmake -S "$dir" -B "$dir.build" -G Ninja \
-        -DCMAKE_INSTALL_PREFIX=/usr \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DBUILD_TESTING=OFF -DBUILD_QCH=OFF -DBUILD_EXAMPLES=OFF >/dev/null 2>&1 \
-        || { warn "    └─ cmake 配置失败（依赖缺？）"; return 1; }
-      cmake --build "$dir.build" -j"$(nproc)" >/dev/null 2>&1 \
-        || { warn "    └─ 编译失败"; return 1; }
-      cmake --install "$dir.build" >/dev/null 2>&1 \
-        || { warn "    └─ 安装失败"; return 1; }
+      # ⚠️ 这里必须把输出留着：第一版写 >/dev/null 2>&1，结果 cmake 失败时什么都看不到，
+      #    只能干猜「依赖缺」（实测就是这么浪费了一轮构建）。
+      if ! cmake -S "$dir" -B "$dir.build" -G Ninja \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF -DBUILD_QCH=OFF -DBUILD_EXAMPLES=OFF >"$logf" 2>&1; then
+        warn "    └─ cmake 配置失败，日志尾部："
+        tail -25 "$logf" | sed 's/^/        /'
+        return 1
+      fi
+      if ! cmake --build "$dir.build" -j"$(nproc)" >>"$logf" 2>&1; then
+        warn "    └─ 编译失败，日志尾部："
+        tail -25 "$logf" | sed 's/^/        /'
+        return 1
+      fi
+      if ! cmake --install "$dir.build" >>"$logf" 2>&1; then
+        warn "    └─ 安装失败，日志尾部："
+        tail -15 "$logf" | sed 's/^/        /'
+        return 1
+      fi
       log "    └─ 完成"
       return 0
     }
 
     # ① KF6 NetworkManagerQt —— ksystemstats 的网络插件就是因为缺它才加载失败：
     #    ksystemstats_plugin_network.so → libKF6NetworkManagerQt.so.6: 没有那个文件
-    if ls /usr/lib/libKF6NetworkManagerQt.so* >/dev/null 2>&1; then
-      log "    KF6 NetworkManagerQt 已存在，跳过"
+    #    注意上游那条经验：SteamOS 的 extra 只给到 6.1.0，而 Plasma 6.2.5 那批至少需要 6.5 ——
+    #    所以「文件在」不等于「够新」，版本不够照样自己编一份。
+    NMQ_VER="$(pacman -Q networkmanager-qt 2>/dev/null | awk '{print $2}' || true)"
+    if [[ -n "$NMQ_VER" ]] && \
+       [[ "$(printf '%s\n6.5\n' "${NMQ_VER%%-*}" | sort -V | head -n1)" == "6.5" ]]; then
+      log "    KF6 NetworkManagerQt 已存在且 >= 6.5（$NMQ_VER），跳过"
     else
+      log "    KF6 NetworkManagerQt 版本不足（${NMQ_VER:-未安装}）→ 自编 6.14"
       kde_build networkmanager-qt \
         "https://download.kde.org/stable/frameworks/6.14/networkmanager-qt-6.14.0.tar.xz" \
         "networkmanager-qt-6.14.0"
