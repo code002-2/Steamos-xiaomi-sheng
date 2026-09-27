@@ -1535,47 +1535,57 @@ log "已放入 sheng-steam-focus（+ 同名的 user 单元）"
 if [[ "${BUILD_KDE_MONITOR:-1}" == "1" ]]; then
   (
     set +e
+    set +u      # 这一段里任何一个未定义变量都不该把整块打死（踩过一次：local 写法出错 → 后面全没跑）
     log "13) 自编 KDE 组件（系统监视器 / KF6 NetworkManagerQt）"
     export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
     KDE_DEPS="base-devel cmake ninja extra-cmake-modules pkgconf \
               qt6-base qt6-declarative qt6-tools qt6-wayland \
-              kconfig kcoreaddons ki18n kio kitemodels kirigami kquickcharts kpackage kdeclarative \
+              kconfig kcoreaddons ki18n kio kitemmodels kirigami kquickcharts kpackage kdeclarative \
               networkmanager-qt modemmanager-qt polkit-qt6 libnl libpcap"
     pacman -Sy --noconfirm >/dev/null 2>&1
+    # ⚠️ pacman -S 只要有一个包名不存在，**整条事务都会中止**（实测 `kitemodels` 少个 m →
+    #    一个构建依赖都没装上，后面 cmake 自然全线失败）。所以先逐个校验包名再装。
+    KDE_DEPS_OK=""
+    for _p in $KDE_DEPS; do
+      if pacman -Si "$_p" >/dev/null 2>&1; then
+        KDE_DEPS_OK="$KDE_DEPS_OK $_p"
+      else
+        warn "    跳过仓库里不存在的包名: $_p"
+      fi
+    done
+    log "    待装构建依赖:$(printf '%s\n' $KDE_DEPS_OK | wc -l) 个"
     pacman -Qq > /tmp/kde-before.txt 2>/dev/null
-    KDE_PAC_OUT="$(pacman -S --noconfirm --needed --color never $KDE_DEPS 2>&1)"
-    printf '%s\n' "$KDE_PAC_OUT" | grep -E '^error|target not found|:: ' | head -20 | sed 's/^/    pacman: /' || true
+    KDE_PAC_OUT="$(pacman -S --noconfirm --needed --color never $KDE_DEPS_OK 2>&1)"
+    printf '%s\n' "$KDE_PAC_OUT" | grep -E '^error|target not found' | head -10 | sed 's/^/    pacman: /' || true
+    printf '%s\n' "$KDE_PAC_OUT" | grep -c '^installing' | sed 's/^/    pacman 本次安装条目数: /' || true
     pacman -Qq > /tmp/kde-after.txt 2>/dev/null
-    comm -13 <(sort /tmp/kde-before.txt) <(sort /tmp/kde-after.txt) > /tmp/kde-added.txt 2>/dev/null
-    KDE_ADDED="$(grep -c . /tmp/kde-added.txt 2>/dev/null || echo '?')"
-    log "    构建依赖就绪（新装 $KDE_ADDED 个包）"
-    printf '%s\n' "$KDE_PAC_OUT" | grep -c 'installing' | sed 's/^/    pacman 安装条目数: /' || true
 
     mkdir -p /tmp/kde-build && cd /tmp/kde-build || exit 0
 
     kde_build() {   # $1=名字 $2=下载地址 $3=解压目录
-      local name="$1" url="$2" dir="$3" logf="/tmp/kde-build/$name.log"
-      log "    ├─ $name"
-      curl -fsSL --retry 2 --max-time 300 -o "$name.tar.xz" "$url" || { warn "    └─ 下载失败: $url"; return 1; }
-      tar -xf "$name.tar.xz" || { warn "    └─ 解压失败"; return 1; }
-      # ⚠️ 这里必须把输出留着：第一版写 >/dev/null 2>&1，结果 cmake 失败时什么都看不到，
-      #    只能干猜「依赖缺」（实测就是这么浪费了一轮构建）。
-      if ! cmake -S "$dir" -B "$dir.build" -G Ninja \
+      local _name="$1" _url="$2" _dir="$3"
+      local _logf="/tmp/kde-build/${_name}.log"
+      log "    ├─ ${_name}"
+      curl -fsSL --retry 2 --max-time 300 -o "${_name}.tar.xz" "$_url" \
+        || { warn "    └─ 下载失败: $_url"; return 1; }
+      tar -xf "${_name}.tar.xz" || { warn "    └─ 解压失败"; return 1; }
+      # ⚠️ 输出必须留着：第一版写 >/dev/null 2>&1，cmake 失败时什么都看不到，只能干猜「依赖缺」
+      if ! cmake -S "$_dir" -B "${_dir}.build" -G Ninja \
             -DCMAKE_INSTALL_PREFIX=/usr \
             -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_TESTING=OFF -DBUILD_QCH=OFF -DBUILD_EXAMPLES=OFF >"$logf" 2>&1; then
+            -DBUILD_TESTING=OFF -DBUILD_QCH=OFF -DBUILD_EXAMPLES=OFF >"$_logf" 2>&1; then
         warn "    └─ cmake 配置失败，日志尾部："
-        tail -25 "$logf" | sed 's/^/        /'
+        tail -25 "$_logf" | sed 's/^/        /'
         return 1
       fi
-      if ! cmake --build "$dir.build" -j"$(nproc)" >>"$logf" 2>&1; then
+      if ! cmake --build "${_dir}.build" -j"$(nproc)" >>"$_logf" 2>&1; then
         warn "    └─ 编译失败，日志尾部："
-        tail -25 "$logf" | sed 's/^/        /'
+        tail -25 "$_logf" | sed 's/^/        /'
         return 1
       fi
-      if ! cmake --install "$dir.build" >>"$logf" 2>&1; then
+      if ! cmake --install "${_dir}.build" >>"$_logf" 2>&1; then
         warn "    └─ 安装失败，日志尾部："
-        tail -15 "$logf" | sed 's/^/        /'
+        tail -15 "$_logf" | sed 's/^/        /'
         return 1
       fi
       log "    └─ 完成"
