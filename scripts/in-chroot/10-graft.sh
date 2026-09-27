@@ -963,6 +963,22 @@ for u in $(awk -F: '$3>=1000 && $3<65534 {print $1":"$3":"$4":"$6}' /etc/passwd 
       && log "已建家目录 $home_（$un）"
   fi
 done
+
+# ⚠️ 只有「分区真的铺到磁盘末尾」才打完成标记。
+#   实机踩过：sda30 已挂载时 growpart 会报 "Re-reading the partition table failed:
+#   Device or resource busy"（挂着的分区没法重读表），此时扩容其实没生效 ——
+#   如果照样打标记，以后每次开机都跳过 → 分区永远保持小尺寸。
+#   所以扩不动就不打标记，等下次启动（那时表能被重读）再试。
+PART_START="$(cat "/sys/class/block/${PART_BASE}/start" 2>/dev/null || echo '')"
+PART_SECTORS="$(cat "/sys/class/block/${PART_BASE}/size" 2>/dev/null || echo '')"
+DISK_SECTORS="$(cat "/sys/class/block/${DISK_NAME}/size" 2>/dev/null || echo '')"
+if [[ -n "$PART_START" && -n "$PART_SECTORS" && -n "$DISK_SECTORS" ]] \
+   && (( PART_START + PART_SECTORS + 2048 < DISK_SECTORS )); then
+  log "分区尚未铺满磁盘（末扇区 $((PART_START + PART_SECTORS)) / 磁盘 $DISK_SECTORS）——"
+  log "多半是分区表没能重读（分区在挂载中）。不打完成标记，下次启动继续。"
+  exit 0
+fi
+
 touch "$STAMP"
 log "=== expand-home done ==="
 exit 0
