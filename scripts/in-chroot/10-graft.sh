@@ -83,9 +83,18 @@ depmod -a "$KVER" || warn "depmod 失败"
 #    根分区用 PARTLABEL：与上游 boot.img 的 cmdline（root=PARTLABEL=userdata）保持一致。
 #    ⚠️ 曾经改成 UUID=ee8d3593-…，结果镜像起不来 —— 已回退，别再无谓地动这里。
 log "写 /etc/fstab: PARTLABEL=$PARTLABEL"
+# 分区布局：SteamOS PC/掌机那一套是「root + home 两块」（参考 MaSieS4Fun/SteamOS-ARM-SM8550，
+# 同一份 Frame 底包，他们的布局是 p1 BOOT / p2 root / p3 home）。我们的 root 在 $PARTLABEL 上，
+# 另外给 /home 留一个 PARTLABEL=home 的分区：
+#   * 有 home 分区 → 挂上去，重刷 rootfs 不再丢用户数据
+#   * 没有 home 分区 → nofail 保证启动照常，/home 就留在 root 里
+#     （**同一条 fstab 两种布局都能开机**，所以不强制用户立刻重分区）
+# x-systemd.growfs 让文件系统首启扩到分区大小；分区本身（growpart）由 sheng-expand-home.service 做。
 cat > /etc/fstab <<EOF
-# steamos-sheng：sheng 分区布局（首启由 growfs 扩到分区实际大小）
+# steamos-sheng：sheng 分区布局（root 首启由 growfs 扩到分区实际大小）
 PARTLABEL=$PARTLABEL /      ext4  defaults,x-systemd.growfs  0 1
+# 可选的独立 home：分区不存在时 nofail 保证不影响启动；存在则由 sheng-expand-home 首启扩容
+PARTLABEL=home       /home  ext4  defaults,noatime,nofail,x-systemd.growfs  0 2
 EOF
 
 # 5) 基本系统配置
@@ -509,7 +518,8 @@ if [[ -x /usr/bin/startplasma-wayland ]]; then
 [Desktop Entry]
 Name=Plasma (Wayland, sheng)
 Comment=Start Plasma Wayland directly (no gamescope; the Frame gamescope session targets a VR headset)
-Exec=/usr/bin/startplasma-wayland
+Exec=/usr/lib/steamos/sheng-startplasma
+TryExec=/usr/bin/startplasma-wayland
 Type=Application
 DesktopNames=KDE
 EOF
@@ -609,5 +619,365 @@ done
 #     ⑤ 依赖体检：Frame 底包缺哪些运行期依赖，在这里一次说清楚（不致命，只报告）
 log "依赖体检（pacman -Dk，下面每行都是「某个包缺某个依赖」）："
 pacman -Dk 2>&1 | grep -v '^checking' | sed 's/^/    /' || true
+
+# 11) SteamOS-on-SM8550 通用修复（移植自 MaSieS4Fun/SteamOS-ARM-SM8550）
+#     那个项目跟我们是**同一份底包**（Valve Steam Frame / Deckard userspace），目标设备是
+#     AYN Odin 2 / Thor 那批 SM8550 掌机。下面的每一条都是他们在实机上验证过的，
+#     注释保留「为什么」。没有移植的：① 他们用 ROCKNIX ABL 启动（p1 vfat BOOT + KERNEL），
+#     我们是 boot.img 刷 boot_b；② 音频那套是他们 aw88166 功放专用，sheng 是 cs35l43 + 自己的
+#     UCM，不通用。
+
+# 11.1 VARIANT_ID=vr → steamdeck
+#   原话：Frame steamclient reads VARIANT_ID=vr and Gamepad UI then throws.
+#   三个副本都要改：/etc、/usr/lib（镜像内那份）、以及 /var/lib/overlays/etc/upper（ostree 风格覆盖层）。
+_vfix=0
+for _osr in /etc/os-release /usr/lib/os-release /var/lib/overlays/etc/upper/os-release; do
+  [[ -f "$_osr" ]] || continue
+  grep -q '^VARIANT_ID=' "$_osr" || continue
+  sed -i 's/^VARIANT_ID=.*/VARIANT_ID="steamdeck"/' "$_osr" && _vfix=$((_vfix + 1))
+done
+log "VARIANT_ID 已改成 steamdeck（$_vfix 个 os-release 副本）"
+
+# 11.2 无线后端钉死在 wpa_supplicant（这是他们最关键的一条，也是我们「用着用着突然断网」的正解）
+#   原话：Steam/steamos-manager rewrites 99-valve-wifi-backend.conf to iwd；而且
+#   Do not nmcli connect/reconnect here: that flaps wlan0 and Steam stays on the library spinner.
+#   wifi.powersave=2 是关省电 —— 省电会导致「用着用着掉线」。
+install -d /etc/NetworkManager/conf.d /usr/lib/NetworkManager/conf.d /usr/lib/steamos
+cat > /etc/NetworkManager/conf.d/99-valve-wifi-backend.conf <<'EOF'
+[connection]
+wifi.powersave=2
+[device]
+wifi.backend=wpa_supplicant
+EOF
+cp -f /etc/NetworkManager/conf.d/99-valve-wifi-backend.conf \
+      /usr/lib/NetworkManager/conf.d/40-sheng-wifi.conf
+cat > /usr/lib/steamos/sheng-wifi-backend <<'EOF'
+#!/bin/bash
+# 把 NetworkManager 的无线后端钉回 wpa_supplicant。Steam / steamos-manager 会把这个
+# fragment 改写成 iwd（其内核/我们这套上用不了/会抖），所以需要一直被改回来。
+# ⚠️ 这里**不要** nmcli connect/reconnect：会让 wlan0 反复抖动，Steam 卡在载入圈。
+set -u
+BODY='[connection]
+wifi.powersave=2
+[device]
+wifi.backend=wpa_supplicant
+'
+write_one() {
+  local dest="$1"
+  mkdir -p "$(dirname "$dest")"
+  if [[ -f "$dest" ]] && cmp -s <(printf '%s' "$BODY") "$dest"; then
+    chown root:root "$dest" 2>/dev/null || true
+    chmod 0644 "$dest" 2>/dev/null || true
+    return 0
+  fi
+  printf '%s' "$BODY" >"$dest"
+  chown root:root "$dest" 2>/dev/null || true
+  chmod 0644 "$dest"
+}
+write_one /etc/NetworkManager/conf.d/99-valve-wifi-backend.conf
+[[ -d /var/lib/overlays/etc/upper ]] && \
+  write_one /var/lib/overlays/etc/upper/NetworkManager/conf.d/99-valve-wifi-backend.conf
+[[ -d /usr/lib/NetworkManager/conf.d ]] && \
+  write_one /usr/lib/NetworkManager/conf.d/40-sheng-wifi.conf
+ln -sfn /dev/null /etc/systemd/system/iwd.service 2>/dev/null || true
+rm -f /etc/systemd/system/multi-user.target.wants/iwd.service 2>/dev/null || true
+mkdir -p /etc/systemd/system/multi-user.target.wants /etc/systemd/system/NetworkManager.service.wants
+if [[ -f /usr/lib/systemd/system/wpa_supplicant.service ]]; then
+  ln -sfn /usr/lib/systemd/system/wpa_supplicant.service \
+    /etc/systemd/system/multi-user.target.wants/wpa_supplicant.service
+  ln -sfn /usr/lib/systemd/system/wpa_supplicant.service \
+    /etc/systemd/system/NetworkManager.service.wants/wpa_supplicant.service
+fi
+rfkill unblock wifi bluetooth 2>/dev/null || true
+exit 0
+EOF
+chmod 0755 /usr/lib/steamos/sheng-wifi-backend
+cat > /usr/lib/systemd/system/sheng-wifi-backend.service <<'EOF'
+[Unit]
+Description=sheng: 把 NetworkManager 无线后端钉回 wpa_supplicant
+DefaultDependencies=no
+After=local-fs.target
+Before=NetworkManager.service iwd.service
+Wants=local-fs.target
+[Service]
+Type=oneshot
+# RemainAfterExit=yes 会让 PathChanged 之后不再重跑（Steam 又会写回 iwd）
+RemainAfterExit=no
+ExecStart=/usr/lib/steamos/sheng-wifi-backend
+[Install]
+WantedBy=NetworkManager.service
+WantedBy=multi-user.target
+EOF
+cat > /usr/lib/systemd/system/sheng-wifi-backend.path <<'EOF'
+[Unit]
+Description=sheng: Steam 想把无线后端改成 iwd 时改回来
+After=local-fs.target
+[Path]
+PathChanged=/etc/NetworkManager/conf.d/99-valve-wifi-backend.conf
+PathModified=/etc/NetworkManager/conf.d/99-valve-wifi-backend.conf
+PathChanged=/var/lib/overlays/etc/upper/NetworkManager/conf.d/99-valve-wifi-backend.conf
+PathModified=/var/lib/overlays/etc/upper/NetworkManager/conf.d/99-valve-wifi-backend.conf
+Unit=sheng-wifi-backend.service
+[Install]
+WantedBy=multi-user.target
+EOF
+install -d /etc/systemd/system/NetworkManager.service.d
+cat > /etc/systemd/system/NetworkManager.service.d/99-sheng-wpa.conf <<'EOF'
+[Unit]
+After=wpa_supplicant.service
+Wants=wpa_supplicant.service
+[Service]
+ExecStartPre=-/usr/lib/steamos/sheng-wifi-backend
+ExecStartPost=-/usr/lib/steamos/sheng-wifi-backend
+EOF
+systemctl enable sheng-wifi-backend.service sheng-wifi-backend.path 2>/dev/null \
+  && log "已启用 sheng-wifi-backend（service + path 哨兵）" || warn "启用 sheng-wifi-backend 失败"
+
+# 11.3 无线接口名固定成 wlan0
+#   原话：Frame/Steam look for wlan0. Kernel names the WCN7850 wlp1s0.
+#   .link 由 udev 处理（不依赖 systemd-networkd），跟我们「只留 NM 一套管理器」不冲突。
+install -d /usr/lib/systemd/network
+cat > /usr/lib/systemd/network/99-sheng-wlan0.link <<'EOF'
+[Match]
+Type=wlan
+[Link]
+Name=wlan0
+EOF
+log "已固定无线接口名为 wlan0（.link）"
+
+# 11.4 SteamVR / iwd / set-wifi-mac-address 一律屏蔽
+#   Frame 残留：SteamVR 一起 gamescope 就死；set-wifi-mac-address 会在运行期改 MAC（掉线来源之一）。
+install -d /etc/systemd/user /etc/systemd/system
+for u in steamvr.service steamvr-logs.service steamvr-proxmicmute.service \
+         steamvr-v4l2cam.service steamvr-nested-desktop.service; do
+  ln -sfn /dev/null "/etc/systemd/user/$u"
+done
+for u in steamvr-program-ble.service steamvr-v4l2loopback.service \
+         steamvr-set-kernel-thread-priorities.service \
+         set-wifi-mac-address.service iwd.service; do
+  ln -sfn /dev/null "/etc/systemd/system/$u"
+done
+log "已屏蔽 SteamVR 全家桶 / iwd / set-wifi-mac-address"
+
+# 11.5 Plasma 的 Wayland 环境清理
+#   原话：start-gamescope-session used to import QT_QPA_PLATFORM=xcb into that manager;
+#   plasmashell/ksplash then try X11, fail, and leave kwin on a black DSI.
+cat > /usr/lib/steamos/sheng-prepare-plasma <<'EOF'
+#!/bin/bash
+# 从 Game Mode 切桌面时，gamescope 那边残留的环境变量会把 Plasma 带沟里：清掉再显式设 wayland。
+set -u
+[[ -d /tmp/.X11-unix ]] || mkdir -p /tmp/.X11-unix
+# gamescope 建这个目录时没有 sticky 位，kwin 会因此拒绝 Xwayland
+chmod 1777 /tmp/.X11-unix 2>/dev/null || true
+unset QT_QPA_PLATFORM GAMESCOPE_WAYLAND_DISPLAY GAMESCOPE_SESSION_TARGET
+export QT_QPA_PLATFORM=wayland
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=KDE
+export XDG_SESSION_DESKTOP=KDE
+export DESKTOP_SESSION=plasma
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl --user unset-environment \
+    QT_QPA_PLATFORM GAMESCOPE_WAYLAND_DISPLAY GAMESCOPE_SESSION_TARGET \
+    XDG_DESKTOP_PORTAL_DIR || true
+  systemctl --user set-environment \
+    QT_QPA_PLATFORM=wayland XDG_SESSION_TYPE=wayland \
+    XDG_CURRENT_DESKTOP=KDE XDG_SESSION_DESKTOP=KDE DESKTOP_SESSION=plasma || true
+fi
+if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+  dbus-update-activation-environment --systemd \
+    QT_QPA_PLATFORM XDG_SESSION_TYPE XDG_CURRENT_DESKTOP \
+    XDG_SESSION_DESKTOP DESKTOP_SESSION >/dev/null 2>&1 || true
+fi
+exit 0
+EOF
+chmod 0755 /usr/lib/steamos/sheng-prepare-plasma
+cat > /usr/lib/steamos/sheng-startplasma <<'EOF'
+#!/bin/bash
+# 官方 startplasma-wayland，但先清掉 Game Mode 留下的 Qt/X11 环境
+/usr/lib/steamos/sheng-prepare-plasma
+exec /usr/bin/startplasma-wayland "$@"
+EOF
+chmod 0755 /usr/lib/steamos/sheng-startplasma
+cat > /usr/lib/systemd/user/sheng-plasma-env.service <<'EOF'
+[Unit]
+Description=sheng: Plasma Wayland 环境清理
+DefaultDependencies=no
+Before=plasma-core.target plasma-workspace.target plasma-workspace-wayland.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/steamos/sheng-prepare-plasma
+EOF
+cat > /usr/lib/steamos/sheng-plasma-wayland.conf <<'EOF'
+[Service]
+Environment=QT_QPA_PLATFORM=wayland
+Environment=XDG_SESSION_TYPE=wayland
+Environment=XDG_CURRENT_DESKTOP=KDE
+Environment=XDG_SESSION_DESKTOP=KDE
+UnsetEnvironment=GAMESCOPE_WAYLAND_DISPLAY
+EOF
+plasma_n=0
+for svc in plasma-plasmashell plasma-ksplash plasma-ksmserver plasma-kcminit plasma-kcminit-phase1 \
+           plasma-kded6 plasma-kwin_wayland plasma-gmenudbusmenuproxy plasma-xembedsniproxy \
+           plasma-kaccess plasma-powerdevil plasma-polkit-agent plasma-kglobalaccel plasma-kscreen \
+           plasma-xdg-desktop-portal-kde plasma-krunner plasma-kactivitymanagerd plasma-dolphin \
+           plasma-ksystemstats plasma-restoresession plasma-baloorunner; do
+  install -d "/usr/lib/systemd/user/${svc}.service.d"
+  cp -f /usr/lib/steamos/sheng-plasma-wayland.conf \
+        "/usr/lib/systemd/user/${svc}.service.d/99-sheng-wayland.conf"
+  plasma_n=$((plasma_n + 1))
+done
+log "已给 $plasma_n 个 plasma-* user 单元装上 Wayland 环境 drop-in"
+
+# 11.6 gamescope 会话（游戏模式）：摘掉 SteamVR 耦合
+#   原话：Drop SteamVR coupling from the Frame image; otherwise gamescope dies with steamvr.
+#   以及 GAMESCOPE_FORCE_INTERNAL=1 强制走内屏（Frame 那套默认往 VR 头显走）。
+install -d /usr/lib/systemd/user/gamescope-session.service.d \
+           /usr/lib/systemd/user/gamescope-session.target.d
+_icd=""
+for _c in /usr/share/vulkan/icd.d/freedreno_icd.aarch64.json \
+          /usr/share/vulkan/icd.d/freedreno_icd.json; do
+  [[ -f "$_c" ]] && { _icd="$_c"; break; }
+done
+{
+  echo '[Unit]'
+  echo 'Description=Gamescope sheng session'
+  echo '# 摘掉 Frame 的 SteamVR 耦合：不摘 gamescope 会跟着 steamvr 一起死'
+  echo 'PartOf='
+  echo 'PartOf=graphical-session.target'
+  echo ''
+  echo '[Service]'
+  echo 'TimeoutStartSec=45'
+  echo 'Environment=GAMESCOPE_FORCE_INTERNAL=1'
+  if [[ -n "$_icd" ]]; then
+    echo "Environment=VK_ICD_FILENAMES=$_icd"
+    echo "Environment=VK_DRIVER_FILES=$_icd"
+  fi
+} > /usr/lib/systemd/user/gamescope-session.service.d/99-sheng.conf
+cat > /usr/lib/systemd/user/gamescope-session.target.d/99-sheng.conf <<'EOF'
+[Unit]
+Description=Gamescope sheng session
+# 重置 Frame 的 SteamVR wants，只留 Steam 与它的辅助服务
+Wants=
+Wants=steam.service
+Wants=steam-notif-daemon.service
+Wants=ibus-gamescope.service
+EOF
+log "gamescope 会话已解耦 SteamVR（Vulkan ICD: ${_icd:-未探测到，跳过}）"
+
+# 11.7 jupiter-dock-updater 桩
+#   原话：Odin 2 has no dock. Missing /usr/bin/jupiter-dock-updater is exit 127 and Steam shows
+#   "Error de actualización". --check must exit 7 (up to date). sheng 是平板，同样没有 dock。
+if [[ ! -e /usr/bin/jupiter-dock-updater ]]; then
+  cat > /usr/bin/jupiter-dock-updater <<'EOF'
+#!/usr/bin/env bash
+# sheng 没有 Valve Dock，但 Steam 在「软件更新」里会探测这个程序。
+#   --check 退出 0  → 有更新（Steam 会卡在 apply）
+#   --check 退出 7  → 已是最新（我们永远回这个）
+#   程序缺失       → 127 → Steam 报「更新错误」
+set -uo pipefail
+FW_VER="0.13.15.124"
+for arg in "$@"; do
+  case "$arg" in
+    --check) echo "FW Current: ${FW_VER}"; echo "FW Available: ${FW_VER}"; echo "FW up to date"; exit 7 ;;
+  esac
+done
+exit 0
+EOF
+  chmod 0755 /usr/bin/jupiter-dock-updater
+  install -d /usr/bin/steamos-polkit-helpers
+  ln -sfn /usr/bin/jupiter-dock-updater /usr/bin/steamos-polkit-helpers/jupiter-dock-updater
+  log "已放入 jupiter-dock-updater 桩（Steam 软件更新不再报错）"
+fi
+
+# 11.8 独立 home 分区：首启格式化 → 扩分区 → 扩文件系统 → 重建家目录
+#   移植自他们的 steamos-sm8550-expand-home，改成 PARTLABEL=home，并多做一步：
+#   分区存在但还没格式化时自动 mkfs（这样用户只要分好区、不用手动 mkfs）。
+#   没有 home 分区就静默退出且**不打标记**，以后补上分区依然生效。
+cat > /usr/lib/steamos/sheng-expand-home <<'EOF'
+#!/bin/bash
+# 让独立的 /home 分区可用并铺满：mkfs（若空白）→ growpart → resize2fs → 重建用户家目录。
+set -u
+STAMP=/var/lib/sheng/home-ready
+LOG=/var/log/sheng-expand-home.log
+mkdir -p "$(dirname "$STAMP")" /var/log
+exec >>"$LOG" 2>&1
+ts() { date -Iseconds; }
+log() { printf '%s %s\n' "$(ts)" "$*"; }
+log "=== expand-home start ==="
+[[ -f "$STAMP" ]] && { log "已有标记 $STAMP，跳过"; exit 0; }
+
+HOME_SRC=""
+for c in /dev/disk/by-partlabel/home /dev/disk/by-label/home; do
+  [[ -b "$c" ]] && { HOME_SRC="$(readlink -f "$c")"; break; }
+done
+[[ -n "$HOME_SRC" ]] || { log "没有 home 分区（PARTLABEL=home / LABEL=home 都没有），下次再看"; exit 0; }
+log "home 分区: $HOME_SRC"
+
+FSTYPE="$(blkid -o value -s TYPE "$HOME_SRC" 2>/dev/null || true)"
+if [[ -z "$FSTYPE" ]]; then
+  log "分区还是空白 → mkfs.ext4 -L home"
+  mkfs.ext4 -F -L home -m 1 "$HOME_SRC" || { log "mkfs 失败，下次重试"; exit 0; }
+  FSTYPE=ext4
+fi
+case "$FSTYPE" in
+  ext2|ext3|ext4) ;;
+  *) log "home 文件系统是 $FSTYPE，不是 ext*，不动它"; exit 0 ;;
+esac
+
+mountpoint -q /home || { mount "$HOME_SRC" /home 2>/dev/null || mount /home 2>/dev/null || true; }
+mountpoint -q /home && log "/home 已挂载" || log "警告：/home 未挂载，继续尝试扩容"
+
+PART_BASE="$(basename "$HOME_SRC")"
+PART_NUM="$(cat "/sys/class/block/${PART_BASE}/partition" 2>/dev/null || true)"
+DISK_NAME="$(lsblk -no PKNAME "$HOME_SRC" 2>/dev/null | head -1 || true)"
+if [[ -n "$DISK_NAME" && -n "$PART_NUM" ]]; then
+  if command -v growpart >/dev/null 2>&1; then
+    growpart "/dev/${DISK_NAME}" "$PART_NUM" 2>&1 || log "growpart 非 0（多半已经是最大）"
+  else
+    echo ", +" | sfdisk --no-reread -N "$PART_NUM" "/dev/${DISK_NAME}" 2>&1 || true
+  fi
+  udevadm settle 2>/dev/null || true
+  partx -u "/dev/${DISK_NAME}" 2>/dev/null || true
+  sleep 0.2
+fi
+resize2fs "$HOME_SRC" 2>&1 || log "resize2fs 非 0（Nothing to do 属正常）"
+
+# 空 home 分区会把 root 里的 /home/<user> 盖掉 → 按 /etc/passwd 重建，否则 SDDM 自动登录会找不到家目录
+for u in $(awk -F: '$3>=1000 && $3<65534 {print $1":"$3":"$4":"$6}' /etc/passwd 2>/dev/null); do
+  un="${u%%:*}"; rest="${u#*:}"; uid_="${rest%%:*}"; rest="${rest#*:}"
+  gid_="${rest%%:*}"; home_="${rest#*:}"
+  [[ -n "$home_" && "$home_" != "/" ]] || continue
+  if [[ ! -d "$home_" ]]; then
+    mkdir -p "$home_" && chown "$uid_:$gid_" "$home_" && chmod 0755 "$home_" \
+      && log "已建家目录 $home_（$un）"
+  fi
+done
+touch "$STAMP"
+log "=== expand-home done ==="
+exit 0
+EOF
+chmod 0755 /usr/lib/steamos/sheng-expand-home
+cat > /usr/lib/systemd/system/sheng-expand-home.service <<'EOF'
+[Unit]
+Description=sheng: 独立 home 分区首启准备与扩容
+DefaultDependencies=no
+Conflicts=shutdown.target
+After=systemd-remount-fs.service
+After=home.mount
+Before=display-manager.service graphical.target
+ConditionPathExists=!/var/lib/sheng/home-ready
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/steamos/sheng-expand-home
+TimeoutStartSec=180
+[Install]
+WantedBy=local-fs.target
+WantedBy=multi-user.target
+EOF
+systemctl enable sheng-expand-home.service 2>/dev/null \
+  && log "已启用 sheng-expand-home（有 home 分区就自动格式化 + 扩容）" \
+  || warn "启用 sheng-expand-home 失败"
 
 log "sheng 设备层注入完成（内核 $KVER）"
