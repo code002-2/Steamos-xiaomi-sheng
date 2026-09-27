@@ -537,6 +537,16 @@ fi
 # 否则用户会话启动超时 → 图形会话根本起不来（实测 "start operation timed out"）
 systemctl enable steamos-manager.service 2>/dev/null \
   && log "已启用 steamos-manager.service（系统侧）" || warn "启用 steamos-manager.service 失败"
+# steamos-manager 的「设备表」：底包带的是 Valve 自家设备（deckard 等）。
+# sheng 的 device tree 里 compatible = "xiaomi,sheng"，而且**没有任何 Valve/steamos/deckard 节点**
+# （已核对 D:\...\sm8550-xiaomi-sheng.dts），所以这一条只能我们自己加，而 device/variant 该填什么
+# 必须照抄底包已有条目的取值、不能凭空发明。这里先把底包自带的设备表原样打出来供核对；
+# 没有匹配项时 steamos-manager 走默认行为（我们的 daemon 本来就在正常跑，所以不阻塞）。
+if [[ -d /usr/share/steamos-manager/devices ]]; then
+  log "底包自带 steamos-manager 设备表：$(ls -1 /usr/share/steamos-manager/devices 2>/dev/null | tr '\n' ' ')"
+  grep -hE '^(device|variant|friendly_name|dt\.compatible)' \
+    /usr/share/steamos-manager/devices/*.toml 2>/dev/null | sed 's/^/    /' | head -40 || true
+fi
 install -d /etc/systemd/system/sddm.service.d
 cat > /etc/systemd/system/sddm.service.d/after-steamos-manager.conf <<'EOF'
 [Unit]
