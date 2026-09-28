@@ -447,7 +447,7 @@ Before=basic.target systemd-logind.service
 Sockets=dbus.socket
 [Service]
 Type=notify
-ExecStart=/usr/bin/dbus-daemon --system --nofork --nopidfile
+ExecStart=/usr/bin/dbus-daemon --system --nofork --nopidfile --systemd-activation
 ExecReload=/bin/kill -HUP $MAINPID
 [Install]
 WantedBy=sysinit.target
@@ -458,6 +458,13 @@ EOF
   #   · service 由 sysinit.target 明确拉起 → 早于 logind，不等 PAM 按需激活（避免抢时序）
   #   背景：底包的服务激活文件是 dbus-broker 专属写法（Exec=/bin/false + SystemdService=…），
   #        换 dbus-daemon 后那条路直接是 false ✗，所以必须让 logind 自己占名字。
+  #   ⚠️ 实机复查（新镜像上 journalctl 仍有）：
+  #        dbus-daemon[631]: [system] Activated service 'org.freedesktop.hostname1' failed:
+  #                          Launch helper exited with unknown return code 1
+  #      —— 说明「先让 logind 自己占名字」只挡住了 logind，别的服务（hostnamed/timedated…）
+  #      仍然走激活文件 → dbus-daemon 去 exec `/bin/false` → launch helper 退 1。
+  #      正解是给 dbus-daemon 开 `--systemd-activation`：它看到 `SystemdService=` 就转而请
+  #      systemd 拉起对应单元，不再自己 exec。所以 ExecStart 里那个开关是必须的，别删。
   systemctl enable dbus.socket 2>/dev/null && log "已启用 dbus.socket" || warn "启用 dbus.socket 失败"
   systemctl enable dbus.service 2>/dev/null && log "dbus.service 已挂到 sysinit.target（早于 logind）" \
     || warn "启用 dbus.service 失败"
@@ -740,8 +747,23 @@ Wants=wpa_supplicant.service
 ExecStartPre=-/usr/lib/steamos/sheng-wifi-backend
 ExecStartPost=-/usr/lib/steamos/sheng-wifi-backend
 EOF
-systemctl enable sheng-wifi-backend.service sheng-wifi-backend.path 2>/dev/null \
-  && log "已启用 sheng-wifi-backend（service + path 哨兵）" || warn "启用 sheng-wifi-backend 失败"
+# ⚠️ 实机复查：`.path` 单元状态是 `enabled` 但 `Active: inactive (dead)` —— 根本没被拉起来
+#   （status 里 Triggers 指向 service，Active 却是 inactive）。与其跟 path 单元的生命周期较劲，
+#   再加一个 timer 兜底：开机 30 秒后、之后每 60 秒跑一次。Steam 就算改了后端，最多一分钟后
+#   就被改回来。脚本本身是幂等的（内容相同就不写），所以高频触发没有副作用。
+cat > /usr/lib/systemd/system/sheng-wifi-backend.timer <<'EOF'
+[Unit]
+Description=sheng: 周期性把无线后端钉回 wpa_supplicant
+After=local-fs.target
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+Unit=sheng-wifi-backend.service
+[Install]
+WantedBy=timers.target
+EOF
+systemctl enable sheng-wifi-backend.service sheng-wifi-backend.path sheng-wifi-backend.timer 2>/dev/null \
+  && log "已启用 sheng-wifi-backend（service + path 哨兵 + 60 秒 timer 兜底）" || warn "启用 sheng-wifi-backend 失败"
 
 # 11.3 无线接口名固定成 wlan0
 #   原话：Frame/Steam look for wlan0. Kernel names the WCN7850 wlp1s0.
