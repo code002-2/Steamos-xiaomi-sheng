@@ -93,8 +93,11 @@ log "写 /etc/fstab: PARTLABEL=$PARTLABEL"
 cat > /etc/fstab <<EOF
 # steamos-sheng：sheng 分区布局（root 首启由 growfs 扩到分区实际大小）
 PARTLABEL=$PARTLABEL /      ext4  defaults,x-systemd.growfs  0 1
-# 可选的独立 home：分区不存在时 nofail 保证不影响启动；存在则由 sheng-expand-home 首启扩容
-PARTLABEL=home       /home  ext4  defaults,noatime,nofail,x-systemd.growfs  0 2
+# 独立的 home：**按实机要求写死 /dev/sda30**（sheng 上 UFS 就是 sda，分区号稳定）。
+# nofail 保证这块分区不存在时照常启动（/home 就留在 root 里）。
+# ⚠️ 代价：以后若重新分区、sda30 不再是 home，这行要跟着改；
+#    sheng-expand-home 里对 PARTLABEL=home / LABEL=home 也做了兜底，但那只是脚本层。
+/dev/sda30           /home  ext4  defaults,noatime,nofail,x-systemd.growfs  0 2
 EOF
 
 # 5) 基本系统配置
@@ -940,10 +943,17 @@ log "=== expand-home start ==="
 [[ -f "$STAMP" ]] && { log "已有标记 $STAMP，跳过"; exit 0; }
 
 HOME_SRC=""
-for c in /dev/disk/by-partlabel/home /dev/disk/by-label/home; do
-  [[ -b "$c" ]] && { HOME_SRC="$(readlink -f "$c")"; break; }
+# ⚠️ 实测：光靠 fstab 那行不够。fstab 生成的 mount 单元可能在设备节点出现**之前**就尝试挂载
+#   → 失败；而 nofail 让它不重试，那次开机 /home 就一直留在 root 里（实机就是这么发生的）。
+#   所以先等设备节点（最多 15 秒），再接管挂载。/dev/sda30 是按实机要求加的硬兜底
+#   （fstab 里也写的是它），前两个按名字命中的路径留着，方便以后换分区布局。
+for _i in $(seq 1 30); do
+  for c in /dev/disk/by-partlabel/home /dev/disk/by-label/home /dev/sda30; do
+    [[ -b "$c" ]] && { HOME_SRC="$(readlink -f "$c")"; break 2; }
+  done
+  sleep 0.5
 done
-[[ -n "$HOME_SRC" ]] || { log "没有 home 分区（PARTLABEL=home / LABEL=home 都没有），下次再看"; exit 0; }
+[[ -n "$HOME_SRC" ]] || { log "没有 home 分区（by-partlabel/home、by-label/home、/dev/sda30 都没有），下次再看"; exit 0; }
 log "home 分区: $HOME_SRC"
 
 FSTYPE="$(blkid -o value -s TYPE "$HOME_SRC" 2>/dev/null || true)"
@@ -957,8 +967,18 @@ case "$FSTYPE" in
   *) log "home 文件系统是 $FSTYPE，不是 ext*，不动它"; exit 0 ;;
 esac
 
+# 优先让 systemd 自己的 mount 单元再试一次（这样 systemd 认得这个挂载，其它依赖它的单元
+# 才不会踩空）；实在不行再自己 mount。
+if ! mountpoint -q /home; then
+  systemctl restart home.mount 2>/dev/null || true
+  sleep 0.5
+fi
 mountpoint -q /home || { mount "$HOME_SRC" /home 2>/dev/null || mount /home 2>/dev/null || true; }
-mountpoint -q /home && log "/home 已挂载" || log "警告：/home 未挂载，继续尝试扩容"
+if mountpoint -q /home; then
+  log "/home 已挂载（$(findmnt -no SOURCE /home 2>/dev/null)）"
+else
+  log "警告：/home 仍未挂载 —— 本次不打完成标记，下次启动重试"
+fi
 
 PART_BASE="$(basename "$HOME_SRC")"
 PART_NUM="$(cat "/sys/class/block/${PART_BASE}/partition" 2>/dev/null || true)"
@@ -998,6 +1018,12 @@ if [[ -n "$PART_START" && -n "$PART_SECTORS" && -n "$DISK_SECTORS" ]] \
    && (( PART_START + PART_SECTORS + 2048 < DISK_SECTORS )); then
   log "分区尚未铺满磁盘（末扇区 $((PART_START + PART_SECTORS)) / 磁盘 $DISK_SECTORS）——"
   log "多半是分区表没能重读（分区在挂载中）。不打完成标记，下次启动继续。"
+  exit 0
+fi
+
+# 同理：没挂上也不打标记 —— 否则「分区在、但没挂」这个状态会被永久固化下来
+if ! mountpoint -q /home; then
+  log "/home 没挂上，不打完成标记，下次启动重试"
   exit 0
 fi
 
