@@ -1527,9 +1527,11 @@ cat > /usr/lib/systemd/user/steam.service.d/99-sheng.conf <<'EOF'
 Wants=
 After=
 After=gamescope-session.service
-# 「切换到桌面」会停掉 gamescope；Restart=always 会让 Steam 在没有 Xwayland 的情况下重生
-# → "Unable to open a connection to X"
-BindsTo=gamescope-session.service
+# ⚠️ 这里**不能**用 BindsTo=gamescope-session.service：BindsTo 要求被绑定单元处于活动状态，
+#   否则本单元根本起不来。他们那边设备开机就进 Game Mode（gamescope 一定在跑）所以没事，
+#   而我们是 Plasma 桌面 → gamescope-session 没运行 → steam.service 直接被判依赖失败，
+#   表现就是「Steam 起不来」。用 PartOf 就够：切到桌面停掉 gamescope 时 Steam 跟着停，
+#   但不要求 gamescope 必须先在。
 PartOf=gamescope-session.service
 [Service]
 Restart=on-failure
