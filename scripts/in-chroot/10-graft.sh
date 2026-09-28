@@ -1226,6 +1226,18 @@ if [[ -e /usr/share/deckard/RUNSTEAM.sh ]]; then
 set -euo pipefail
 STEAMROOT="$( cd -- "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 
+# 首次启动把镜像里预下好的 Valve ARM 客户端播种进来。
+# ⚠️ 为什么不在构建期直接写 /home/steamos/.local/share/Steam：/home 可能是**独立分区**，
+#    挂载后会把 root 分区里那份内容整个盖住 → 用户看不到客户端。所以镜像里放
+#    /usr/lib/steam/arm-client（在 / 上），首次启动再拷进用户目录，两种分区布局都成立。
+SEED=/usr/lib/steam/arm-client
+if [[ -d "$SEED" && ! -e "${STEAMROOT}/.sheng-arm-client" ]]; then
+  echo "RUNSTEAM: seeding Steam client from $SEED"
+  mkdir -p "$STEAMROOT"
+  cp -a "$SEED/." "$STEAMROOT/" 2>/dev/null || true
+  touch "${STEAMROOT}/.sheng-arm-client" 2>/dev/null || true
+fi
+
 STEAM_RT_ARM64=steamrtarm64
 STEAM_SDK_ARM64=linuxarm64
 [[ -d "${STEAMROOT}/${STEAM_RT_ARM64}" ]] || { [[ -d "${STEAMROOT}/linuxarm64" ]] && STEAM_RT_ARM64="linuxarm64"; }
@@ -1703,6 +1715,102 @@ if [[ "${BUILD_KDE_MONITOR:-1}" == "1" ]]; then
     fi
     exit 0
   ) 2>&1 | sed 's/^/[kde] /' || warn "自编 KDE 组件这一段失败（不影响出图）"
+fi
+
+# 12.11 把 Valve 官方的 ARM 掌机 Steam 客户端下进镜像
+#   为什么必须换掉底包自带的：Frame 那份是给头显的，他们 repo 原话 ——
+#     `Frame steamclient (version 0, incomplete library IPC)`
+#     `Frame steam.tar.zst is not enough (version 0, missing package zips, spinner)`
+#   所以要用 Valve 公开发布的 steamdeck_stable ARM64 客户端。
+#   做法（照抄他们的 install-steam-arm）：
+#     ① 拉清单 https://client-update.steamstatic.com/steam_client_<channel>_linuxarm64
+#     ② 从清单里解析出 bins_linuxarm64_linuxarm64.zip.<hash> 与 steamui_websrc_all.zip.<hash>
+#     ③ 下载解包
+#   ⚠️ 两个坑：
+#     a) 清单是二进制，要用 grep -a / strings 抽名字；
+#     b) zip 里**部分条目用反斜杠做分隔符**（steamrtarm64\libs\libnghttp2.so），
+#        直接 unzip 会解出带反斜杠的怪文件名 —— 必须像他们那样用 Python 归一化路径。
+#   落点 /usr/lib/steam/arm-client/（在 / 上），首次启动由 RUNSTEAM.sh 播种进用户目录。
+if [[ "${DOWNLOAD_STEAM_CLIENT:-1}" == "1" ]]; then
+  (
+    set +e
+    set +u
+    STEAM_CHANNEL="${STEAM_CHANNEL:-steamdeck_stable}"
+    SEED=/usr/lib/steam/arm-client
+    MANIFEST="steam_client_${STEAM_CHANNEL}_linuxarm64"
+    BASE="https://client-update.steamstatic.com"
+    log "12.11 下载 Steam ARM 客户端（channel=$STEAM_CHANNEL）→ $SEED"
+    command -v python3 >/dev/null 2>&1 || warn "    没有 python3，无法归一化解包，跳过"
+    mkdir -p "$SEED" /tmp/steamdl && cd /tmp/steamdl || exit 0
+
+    if ! curl -fsSL --retry 2 --max-time 120 -o "$MANIFEST" "$BASE/$MANIFEST"; then
+      warn "    清单下载失败（$BASE/$MANIFEST）—— 网络或通道名变了"
+      exit 0
+    fi
+    # 抽名字：grep -a 直接吃二进制清单
+    BINS="$(grep -aoE 'bins_linuxarm64_linuxarm64\.zip\.[0-9a-f]+' "$MANIFEST" | head -1)"
+    UI="$(grep -aoE 'steamui_websrc_all\.zip\.[0-9a-f]+' "$MANIFEST" | head -1)"
+    CLIENTVER="$(grep -aoE '"version"[^0-9]*[0-9]{9,}' "$MANIFEST" | grep -aoE '[0-9]{9,}' | head -1)"
+    if [[ -z "$BINS" ]]; then
+      warn "    清单里没解析出 bins_linuxarm64_linuxarm64.zip —— 清单格式变了"
+      exit 0
+    fi
+    log "    bins: $BINS"
+    log "    ui:   ${UI:-（清单里没有，跳过）}"
+    log "    版本: ${CLIENTVER:-未知}"
+
+    extract_zip() {   # $1=zip 文件；用 Python 归一化反斜杠并补执行位
+      python3 - "$1" "$SEED" <<'PY'
+import sys, zipfile, pathlib
+src, dest = sys.argv[1], pathlib.Path(sys.argv[2])
+n = 0
+with zipfile.ZipFile(src) as z:
+    for info in z.infolist():
+        name = info.filename.replace("\\", "/")
+        if name.endswith("/") or name.startswith("/") or ".." in name.split("/"):
+            continue
+        out = dest / name
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(z.read(info))
+        if name.endswith(("/steam", "/steamwebhelper", "/steamwebhelper.sh",
+                          "/steam-runtime-check-requirements", "/.sh")):
+            try: out.chmod(0o755)
+            except Exception: pass
+        n += 1
+print(f"extracted {n} entries")
+PY
+    }
+
+    ok=0
+    for z in "$BINS" "$UI"; do
+      [[ -n "$z" ]] || continue
+      log "    下载 $z …"
+      if ! curl -fsSL --retry 2 --max-time 1200 -o "$z" "$BASE/$z"; then
+        warn "    $z 下载失败"; continue
+      fi
+      log "    解包 $z（$(du -h "$z" | cut -f1)）"
+      extract_zip "$z" 2>&1 | sed 's/^/        /'
+      rm -f "$z"
+      ok=1
+    done
+
+    mkdir -p "$SEED/package"
+    echo "$STEAM_CHANNEL" > "$SEED/package/beta"
+    cp -f "$MANIFEST" "$SEED/package/${MANIFEST}.manifest" 2>/dev/null || true
+    printf 'ClientVersion=%s\n' "${CLIENTVER:-1788652215}" > "$SEED/steam.inf"
+    cp -f "$SEED/steam.inf" "$SEED/steamrtarm64/steam.inf" 2>/dev/null || true
+    printf '%s\n' "$STEAM_CHANNEL" > "$SEED/.sheng-arm-client"
+    touch "$SEED/.install-complete"
+    find "$SEED" -maxdepth 2 -type f \( -name steam -o -name steamwebhelper \) -exec chmod 0755 {} + 2>/dev/null
+
+    # 自检
+    for f in steamrtarm64/steam steamrtarm64/steamui.so steamui/index.html; do
+      if [[ -s "$SEED/$f" ]]; then log "    ✓ $f"; else warn "    ✗ 缺 $f"; fi
+    done
+    log "    客户端体积: $(du -sh "$SEED" 2>/dev/null | cut -f1)"
+    cd / && rm -rf /tmp/steamdl
+    exit 0
+  ) 2>&1 | sed 's/^/[steam] /' || warn "Steam 客户端下载段失败（不影响出图）"
 fi
 
 log "sheng 设备层注入完成（内核 $KVER）"
